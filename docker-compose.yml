@@ -11,8 +11,10 @@ services:
       - REDIS_URL=redis://cache:6379/0
       - SECRET_KEY=supersecretkey
     depends_on:
-      - db
-      - cache
+      db:
+        condition: service_healthy  # Wait for DB to be fully ready
+      cache:
+        condition: service_started
 
   db:
     image: postgres:15
@@ -24,15 +26,25 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cms_db"]
+      interval: 10s      
+      timeout: 5s
+      retries: 10        
+      start_period: 60s  
+
   worker:
     build: .
     command: python -m src.worker
     volumes:
       - .:/app
     environment:
-      - DATABASE_URL=postgresql://user:password@db:5432/cms_db
+      # Fixed to match 'postgres:postgres'
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/cms_db
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+
   cache:
     image: redis:7
     ports:
