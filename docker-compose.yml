@@ -23,7 +23,15 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
+  worker:
+    build: .
+    command: python -m src.worker
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/cms_db
+    depends_on:
+      - db
   cache:
     image: redis:7
     ports:
