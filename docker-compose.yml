@@ -5,6 +5,7 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
+      - ./uploads:/app/uploads
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/cms_db
       - REDIS_URL=redis://cache:6379/0

@@ -1,5 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+import os
+import shutil
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from slugify import slugify
 from typing import List
@@ -11,11 +14,19 @@ from . import models, schemas, auth, database
 app = FastAPI(title="CMS Backend")
 
 # --- DATABASE STARTUP SAFETY ---
-# This prevents the app from crashing if the DB container is still "syncing"
 database.wait_for_db()
 models.Base.metadata.create_all(bind=database.engine)
 
-# This defines the single "Value" box in the Authorize popup
+# --- MEDIA STORAGE SETUP ---
+UPLOAD_DIR = "uploads"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+# Mount the uploads folder so files are accessible via URL
+# e.g., http://localhost:8000/uploads/filename.jpg
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+# --- AUTH CONFIG ---
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 # --- AUTH DEPENDENCY ---
@@ -23,7 +34,6 @@ def get_current_user(token: str = Depends(api_key_header), db: Session = Depends
     if not token:
         raise HTTPException(status_code=401, detail="Missing Authorization Header")
     
-    # Clean the token: remove 'Bearer ' if the user included it in the box
     actual_token = token.replace("Bearer ", "") 
     
     try:
@@ -38,7 +48,6 @@ def get_current_user(token: str = Depends(api_key_header), db: Session = Depends
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     
-    # Ensure only authors can access these management endpoints
     if user.role != schemas.UserRole.author:
         raise HTTPException(status_code=403, detail="Not authorized: Authors only")
     
@@ -56,7 +65,6 @@ def login(user_credentials: schemas.UserLogin, db: Session = Depends(database.ge
 
 # --- POST CONTENT ROUTES ---
 
-# 1. CREATE POST
 @app.post("/posts", response_model=schemas.PostResponse)
 def create_post(post_in: schemas.PostCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     new_post = models.Post(
@@ -71,12 +79,10 @@ def create_post(post_in: schemas.PostCreate, db: Session = Depends(database.get_
     db.refresh(new_post)
     return new_post
 
-# 2. LIST ALL POSTS BY AUTHOR (Pagination)
 @app.get("/posts", response_model=List[schemas.PostResponse])
 def list_posts(skip: int = 0, limit: int = 10, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     return db.query(models.Post).filter(models.Post.author_id == current_user.id).offset(skip).limit(limit).all()
 
-# 3. GET SPECIFIC POST BY ID
 @app.get("/posts/{id}", response_model=schemas.PostResponse)
 def get_post(id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
@@ -84,14 +90,12 @@ def get_post(id: int, db: Session = Depends(database.get_db), current_user: mode
         raise HTTPException(status_code=404, detail="Post not found")
     return post
 
-# 4. UPDATE POST (Triggers Versioning)
 @app.put("/posts/{id}", response_model=schemas.PostResponse)
 def update_post(id: int, post_in: schemas.PostCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     
-    # Save current version to revisions table before applying updates
     revision = models.PostRevision(
         post_id=post.id,
         title_snapshot=post.title,
@@ -100,7 +104,6 @@ def update_post(id: int, post_in: schemas.PostCreate, db: Session = Depends(data
     )
     db.add(revision)
     
-    # Apply new values
     post.title = post_in.title
     post.content = post_in.content
     post.slug = slugify(post_in.title)
@@ -110,7 +113,6 @@ def update_post(id: int, post_in: schemas.PostCreate, db: Session = Depends(data
     db.refresh(post)
     return post
 
-# 5. DELETE POST
 @app.delete("/posts/{id}")
 def delete_post(id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
@@ -120,7 +122,6 @@ def delete_post(id: int, db: Session = Depends(database.get_db), current_user: m
     db.commit()
     return {"message": "Post deleted successfully"}
 
-# 6. PUBLISH POST
 @app.post("/posts/{id}/publish", response_model=schemas.PostResponse)
 def publish_post(id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
@@ -133,7 +134,6 @@ def publish_post(id: int, db: Session = Depends(database.get_db), current_user: 
     db.refresh(post)
     return post
 
-# 7. SCHEDULE POST
 @app.post("/posts/{id}/schedule", response_model=schemas.PostResponse)
 def schedule_post(id: int, sched: schemas.PostSchedule, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
@@ -146,9 +146,28 @@ def schedule_post(id: int, sched: schemas.PostSchedule, db: Session = Depends(da
     db.refresh(post)
     return post
 
+# --- MEDIA UPLOAD ROUTE ---
+
+@app.post("/media/upload")
+def upload_media(file: UploadFile = File(...), current_user: models.User = Depends(get_current_user)):
+    # Generate unique filename using timestamp
+    timestamp = int(datetime.utcnow().timestamp())
+    filename = f"{timestamp}_{file.filename}"
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    
+    # Save the file locally
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    # Return path relative to the server
+    return {
+        "filename": file.filename,
+        "url": f"/uploads/{filename}",
+        "content_type": file.content_type
+    }
+
 # --- VERSIONING ENDPOINTS ---
 
-# 8. GET REVISIONS HISTORY
 @app.get("/posts/{id}/revisions", response_model=List[schemas.PostRevisionResponse])
 def get_revisions(id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
@@ -160,8 +179,6 @@ def get_revisions(id: int, db: Session = Depends(database.get_db), current_user:
     response = []
     for r in revisions:
         rev_user = db.query(models.User).filter(models.User.id == r.revision_author_id).first()
-        
-        # Fallback for timestamp attribute names
         timestamp = getattr(r, 'revision_timestamp', getattr(r, 'created_at', datetime.utcnow()))
         
         response.append({
@@ -174,7 +191,6 @@ def get_revisions(id: int, db: Session = Depends(database.get_db), current_user:
         })
     return response
 
-# 9. RESTORE A PREVIOUS VERSION
 @app.post("/posts/{id}/restore/{revision_id}", response_model=schemas.PostResponse)
 def restore_revision(id: int, revision_id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
@@ -192,4 +208,3 @@ def restore_revision(id: int, revision_id: int, db: Session = Depends(database.g
     db.commit()
     db.refresh(post)
     return post
-# Ready
