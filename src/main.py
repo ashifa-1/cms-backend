@@ -10,7 +10,9 @@ from . import models, schemas, auth, database
 
 app = FastAPI(title="CMS Backend")
 
-# Initialize Database tables
+# --- DATABASE STARTUP SAFETY ---
+# This prevents the app from crashing if the DB container is still "syncing"
+database.wait_for_db()
 models.Base.metadata.create_all(bind=database.engine)
 
 # This defines the single "Value" box in the Authorize popup
@@ -89,7 +91,7 @@ def update_post(id: int, post_in: schemas.PostCreate, db: Session = Depends(data
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     
-    # Before updating, save current version to revisions table
+    # Save current version to revisions table before applying updates
     revision = models.PostRevision(
         post_id=post.id,
         title_snapshot=post.title,
@@ -149,7 +151,6 @@ def schedule_post(id: int, sched: schemas.PostSchedule, db: Session = Depends(da
 # 8. GET REVISIONS HISTORY
 @app.get("/posts/{id}/revisions", response_model=List[schemas.PostRevisionResponse])
 def get_revisions(id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
-    # Verify ownership
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -160,7 +161,7 @@ def get_revisions(id: int, db: Session = Depends(database.get_db), current_user:
     for r in revisions:
         rev_user = db.query(models.User).filter(models.User.id == r.revision_author_id).first()
         
-        # We use getattr to safely check for either name
+        # Fallback for timestamp attribute names
         timestamp = getattr(r, 'revision_timestamp', getattr(r, 'created_at', datetime.utcnow()))
         
         response.append({
@@ -173,7 +174,7 @@ def get_revisions(id: int, db: Session = Depends(database.get_db), current_user:
         })
     return response
 
-# 9. RESTORE A PREVIOUS VERSION (Bonus/Helper for testing)
+# 9. RESTORE A PREVIOUS VERSION
 @app.post("/posts/{id}/restore/{revision_id}", response_model=schemas.PostResponse)
 def restore_revision(id: int, revision_id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
@@ -184,7 +185,6 @@ def restore_revision(id: int, revision_id: int, db: Session = Depends(database.g
     if not revision:
         raise HTTPException(status_code=404, detail="Revision not found")
         
-    # Overwrite current post with historical data
     post.title = revision.title_snapshot
     post.content = revision.content_snapshot
     post.updated_at = datetime.utcnow()
@@ -192,3 +192,4 @@ def restore_revision(id: int, revision_id: int, db: Session = Depends(database.g
     db.commit()
     db.refresh(post)
     return post
+# Ready

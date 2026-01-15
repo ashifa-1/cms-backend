@@ -1,27 +1,15 @@
-import os
 import time
 from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import OperationalError
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Updated to use 'postgres' user which is standard for the postgres image
+SQLALCHEMY_DATABASE_URL = "postgresql://postgres:postgres@db:5432/cms_db"
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-def init_db():
-    # Retry logic to wait for the Postgres container to be fully ready
-    retries = 5
-    while retries > 0:
-        try:
-            from .models import Base
-            Base.metadata.create_all(bind=engine)
-            print("Database connected and tables created!")
-            break
-        except OperationalError:
-            retries -= 1
-            print(f"Database not ready yet... retrying in 5 seconds ({retries} retries left)")
-            time.sleep(5)
+Base = declarative_base()
 
 def get_db():
     db = SessionLocal()
@@ -29,3 +17,17 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def wait_for_db():
+    retries = 10
+    while retries > 0:
+        try:
+            conn = engine.connect()
+            conn.close()
+            print("Successfully connected to the database!")
+            return
+        except Exception as e:
+            print(f"Database not ready yet... ({e})")
+            retries -= 1
+            time.sleep(5)
+    raise Exception("Could not connect to the database")

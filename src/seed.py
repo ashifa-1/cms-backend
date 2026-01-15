@@ -1,16 +1,25 @@
-from database import SessionLocal
-from models import User, UserRole
-from auth import get_password_hash
+from .database import SessionLocal
+from .models import User
+from .auth import get_password_hash
+from .schemas import UserRole
 
-db = SessionLocal()
-if not db.query(User).filter(User.email == "author@example.com").first():
-    test_user = User(
-        username="author1",
-        email="author@example.com",
-        password_hash=get_password_hash("securepassword"),
-        role=UserRole.author
-    )
-    db.add(test_user)
-    db.commit()
-    print("Test author created!")
-db.close()
+def seed_data():
+    db = SessionLocal()
+    # Check if author already exists
+    author = db.query(User).filter(User.email == "author@example.com").first()
+    if not author:
+        new_author = User(
+            username="author_user",
+            email="author@example.com",
+            password_hash=get_password_hash("securepassword"),
+            role=UserRole.author
+        )
+        db.add(new_author)
+        db.commit()
+        print("Seed: Author created!")
+    else:
+        print("Seed: Author already exists.")
+    db.close()
+
+if __name__ == "__main__":
+    seed_data()

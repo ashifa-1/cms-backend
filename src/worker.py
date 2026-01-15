@@ -1,35 +1,38 @@
 import time
 from datetime import datetime
-from sqlalchemy.orm import Session
-from .database import SessionLocal, engine
-from .models import Post, PostStatus
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from . import models, schemas
 
-def check_scheduled_posts():
-    db: Session = SessionLocal()
+# MUST MATCH YOUR database.py
+DATABASE_URL = "postgresql://postgres:postgres@db:5432/cms_db"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def publish_scheduled_posts():
+    db = SessionLocal()
     try:
         now = datetime.utcnow()
-        # Find posts that are 'scheduled' and the time has passed
-        scheduled_posts = db.query(Post).filter(
-            Post.status == PostStatus.scheduled,
-            Post.scheduled_for <= now
+        # Find posts that are scheduled and the time has passed
+        posts = db.query(models.Post).filter(
+            models.Post.status == schemas.PostStatus.scheduled,
+            models.Post.scheduled_for <= now
         ).all()
 
-        for post in scheduled_posts:
-            print(f"Publishing scheduled post: {post.title} (ID: {post.id})")
-            post.status = PostStatus.published
+        for post in posts:
+            print(f"Worker: Publishing post {post.id} - {post.title}", flush=True)
+            post.status = schemas.PostStatus.published
             post.published_at = now
-            db.add(post)
         
         db.commit()
     except Exception as e:
-        print(f"Worker Error: {e}")
-        db.rollback()
+        print(f"Worker Error: {e}", flush=True)
     finally:
         db.close()
 
 if __name__ == "__main__":
-    print("Background worker started...")
+    print("Worker started: Monitoring scheduled posts...", flush=True)
     while True:
-        check_scheduled_posts()
-        # Run every 60 seconds
-        time.sleep(60)
+        publish_scheduled_posts()
+        time.sleep(30)  # Check every 30 seconds
