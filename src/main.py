@@ -1,5 +1,7 @@
 import os
 import shutil
+import json
+import redis
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +19,11 @@ app = FastAPI(title="CMS Backend")
 database.wait_for_db()
 models.Base.metadata.create_all(bind=database.engine)
 
+# --- REDIS SETUP ---
+# 'cache' is the hostname of the redis container defined in docker-compose.yml
+redis_client = redis.Redis(host='cache', port=6379, db=0, decode_responses=True)
+CACHE_EXPIRE = 3600  # Cache expires in 1 hour (3600 seconds)
+
 # --- MEDIA STORAGE SETUP ---
 UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
@@ -27,7 +34,8 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 # --- AUTH CONFIG ---
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
-# --- AUTH DEPENDENCY ---
+# --- HELPERS ---
+
 def get_current_user(token: str = Depends(api_key_header), db: Session = Depends(database.get_db)):
     if not token:
         raise HTTPException(status_code=401, detail="Missing Authorization Header")
@@ -51,7 +59,18 @@ def get_current_user(token: str = Depends(api_key_header), db: Session = Depends
     
     return user
 
+def clear_post_cache(post_id: int = None):
+    """Invalidates cache for a specific post and all list views."""
+    if post_id:
+        redis_client.delete(f"post_cache_{post_id}")
+    
+    # Clear all paginated list caches
+    list_keys = redis_client.keys("published_list_*")
+    if list_keys:
+        redis_client.delete(*list_keys)
+
 # --- AUTH ROUTES ---
+
 @app.post("/auth/login", response_model=schemas.TokenResponse)
 def login(user_credentials: schemas.UserLogin, db: Session = Depends(database.get_db)):
     user = db.query(models.User).filter(models.User.email == user_credentials.email).first()
@@ -61,7 +80,7 @@ def login(user_credentials: schemas.UserLogin, db: Session = Depends(database.ge
     access_token = auth.create_access_token(data={"sub": user.email})
     return {"token": access_token, "user": user}
 
-# --- POST CONTENT ROUTES ---
+# --- POST CONTENT ROUTES (Author Only) ---
 
 @app.post("/posts", response_model=schemas.PostResponse)
 def create_post(post_in: schemas.PostCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
@@ -75,22 +94,44 @@ def create_post(post_in: schemas.PostCreate, db: Session = Depends(database.get_
     db.add(new_post)
     db.commit()
     db.refresh(new_post)
+    # Clear list cache because a new post might eventually be published
+    clear_post_cache()
     return new_post
 
 # ==========================================
-# PUBLIC FACING ENDPOINTS (MOVED UP FOR PRIORITY)
+# PUBLIC FACING ENDPOINTS (WITH REDIS CACHING)
 # ==========================================
 
 @app.get("/posts/published", response_model=List[schemas.PostResponse])
 def list_published_posts(skip: int = 0, limit: int = 10, db: Session = Depends(database.get_db)):
-    """Public list of published posts with pagination."""
-    return db.query(models.Post).filter(
+    cache_key = f"published_list_{skip}_{limit}"
+    
+    # 1. Try to get from Cache
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        return json.loads(cached_data)
+
+    # 2. If not in cache, get from DB
+    posts = db.query(models.Post).filter(
         models.Post.status == schemas.PostStatus.published
     ).offset(skip).limit(limit).all()
+    
+    # 3. Save to cache (convert objects to serializable dicts first)
+    serializable_data = [json.loads(schemas.PostResponse.from_orm(p).json()) for p in posts]
+    redis_client.setex(cache_key, CACHE_EXPIRE, json.dumps(serializable_data))
+    
+    return posts
 
 @app.get("/posts/published/{id}", response_model=schemas.PostResponse)
 def get_published_post(id: int, db: Session = Depends(database.get_db)):
-    """Retrieve a single published post by ID."""
+    cache_key = f"post_cache_{id}"
+    
+    # 1. Try to get from Cache
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        return json.loads(cached_data)
+
+    # 2. If not in cache, get from DB
     post = db.query(models.Post).filter(
         models.Post.id == id, 
         models.Post.status == schemas.PostStatus.published
@@ -98,16 +139,20 @@ def get_published_post(id: int, db: Session = Depends(database.get_db)):
     
     if not post:
         raise HTTPException(status_code=404, detail="Published post not found")
+    
+    # 3. Save to cache
+    serializable_data = json.loads(schemas.PostResponse.from_orm(post).json())
+    redis_client.setex(cache_key, CACHE_EXPIRE, json.dumps(serializable_data))
+    
     return post
 
 @app.get("/search", response_model=List[schemas.PostResponse])
 def search_posts(q: str, db: Session = Depends(database.get_db)):
-    """Full-text search."""
+    """Full-text search (Not cached as queries vary too widely)."""
     results = db.query(models.Post).filter(
         models.Post.status == schemas.PostStatus.published,
         (models.Post.title.ilike(f"%{q}%")) | (models.Post.content.ilike(f"%{q}%"))
     ).all()
-    
     return results
 
 # ==========================================
@@ -120,8 +165,6 @@ def list_posts(skip: int = 0, limit: int = 10, db: Session = Depends(database.ge
 
 @app.get("/posts/{id}", response_model=schemas.PostResponse)
 def get_post(id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
-    # This route used to intercept "published" because it was above the specific route.
-    # Now that "published" is defined above, this will only catch actual IDs.
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -148,6 +191,10 @@ def update_post(id: int, post_in: schemas.PostCreate, db: Session = Depends(data
     
     db.commit()
     db.refresh(post)
+    
+    # --- INVALIDATE CACHE ---
+    clear_post_cache(id)
+    
     return post
 
 @app.delete("/posts/{id}")
@@ -155,8 +202,13 @@ def delete_post(id: int, db: Session = Depends(database.get_db), current_user: m
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+    
     db.delete(post)
     db.commit()
+    
+    # --- INVALIDATE CACHE ---
+    clear_post_cache(id)
+    
     return {"message": "Post deleted successfully"}
 
 @app.post("/posts/{id}/publish", response_model=schemas.PostResponse)
@@ -169,6 +221,10 @@ def publish_post(id: int, db: Session = Depends(database.get_db), current_user: 
     post.published_at = datetime.utcnow()
     db.commit()
     db.refresh(post)
+    
+    # --- INVALIDATE CACHE ---
+    clear_post_cache(id)
+    
     return post
 
 @app.post("/posts/{id}/schedule", response_model=schemas.PostResponse)
@@ -181,6 +237,10 @@ def schedule_post(id: int, sched: schemas.PostSchedule, db: Session = Depends(da
     post.scheduled_for = sched.scheduled_for
     db.commit()
     db.refresh(post)
+    
+    # --- INVALIDATE CACHE ---
+    clear_post_cache(id)
+    
     return post
 
 @app.post("/media/upload")
