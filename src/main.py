@@ -22,7 +22,6 @@ UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 
-# Mount the uploads folder so files are accessible via URL
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # --- AUTH CONFIG ---
@@ -62,7 +61,7 @@ def login(user_credentials: schemas.UserLogin, db: Session = Depends(database.ge
     access_token = auth.create_access_token(data={"sub": user.email})
     return {"token": access_token, "user": user}
 
-# --- POST CONTENT ROUTES (Author Only) ---
+# --- POST CONTENT ROUTES ---
 
 @app.post("/posts", response_model=schemas.PostResponse)
 def create_post(post_in: schemas.PostCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
@@ -78,12 +77,51 @@ def create_post(post_in: schemas.PostCreate, db: Session = Depends(database.get_
     db.refresh(new_post)
     return new_post
 
+# ==========================================
+# PUBLIC FACING ENDPOINTS (MOVED UP FOR PRIORITY)
+# ==========================================
+
+@app.get("/posts/published", response_model=List[schemas.PostResponse])
+def list_published_posts(skip: int = 0, limit: int = 10, db: Session = Depends(database.get_db)):
+    """Public list of published posts with pagination."""
+    return db.query(models.Post).filter(
+        models.Post.status == schemas.PostStatus.published
+    ).offset(skip).limit(limit).all()
+
+@app.get("/posts/published/{id}", response_model=schemas.PostResponse)
+def get_published_post(id: int, db: Session = Depends(database.get_db)):
+    """Retrieve a single published post by ID."""
+    post = db.query(models.Post).filter(
+        models.Post.id == id, 
+        models.Post.status == schemas.PostStatus.published
+    ).first()
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Published post not found")
+    return post
+
+@app.get("/search", response_model=List[schemas.PostResponse])
+def search_posts(q: str, db: Session = Depends(database.get_db)):
+    """Full-text search."""
+    results = db.query(models.Post).filter(
+        models.Post.status == schemas.PostStatus.published,
+        (models.Post.title.ilike(f"%{q}%")) | (models.Post.content.ilike(f"%{q}%"))
+    ).all()
+    
+    return results
+
+# ==========================================
+# END PUBLIC FACING ENDPOINTS
+# ==========================================
+
 @app.get("/posts", response_model=List[schemas.PostResponse])
 def list_posts(skip: int = 0, limit: int = 10, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
     return db.query(models.Post).filter(models.Post.author_id == current_user.id).offset(skip).limit(limit).all()
 
 @app.get("/posts/{id}", response_model=schemas.PostResponse)
 def get_post(id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
+    # This route used to intercept "published" because it was above the specific route.
+    # Now that "published" is defined above, this will only catch actual IDs.
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -95,7 +133,6 @@ def update_post(id: int, post_in: schemas.PostCreate, db: Session = Depends(data
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     
-    # Save a revision before updating
     revision = models.PostRevision(
         post_id=post.id,
         title_snapshot=post.title,
@@ -146,8 +183,6 @@ def schedule_post(id: int, sched: schemas.PostSchedule, db: Session = Depends(da
     db.refresh(post)
     return post
 
-# --- MEDIA UPLOAD ROUTE ---
-
 @app.post("/media/upload")
 def upload_media(file: UploadFile = File(...), current_user: models.User = Depends(get_current_user)):
     timestamp = int(datetime.utcnow().timestamp())
@@ -162,8 +197,6 @@ def upload_media(file: UploadFile = File(...), current_user: models.User = Depen
         "url": f"/uploads/{filename}",
         "content_type": file.content_type
     }
-
-# --- VERSIONING ENDPOINTS ---
 
 @app.get("/posts/{id}/revisions", response_model=List[schemas.PostRevisionResponse])
 def get_revisions(id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
@@ -187,34 +220,3 @@ def get_revisions(id: int, db: Session = Depends(database.get_db), current_user:
             "revision_timestamp": timestamp
         })
     return response
-
-# --- PUBLIC FACING ENDPOINTS (Step 8 - No Auth Required) ---
-
-@app.get("/posts/published", response_model=List[schemas.PostResponse])
-def list_published_posts(skip: int = 0, limit: int = 10, db: Session = Depends(database.get_db)):
-    """Public list of published posts with pagination."""
-    return db.query(models.Post).filter(
-        models.Post.status == schemas.PostStatus.published
-    ).offset(skip).limit(limit).all()
-
-@app.get("/posts/published/{id}", response_model=schemas.PostResponse)
-def get_published_post(id: int, db: Session = Depends(database.get_db)):
-    """Retrieve a single published post by ID."""
-    post = db.query(models.Post).filter(
-        models.Post.id == id, 
-        models.Post.status == schemas.PostStatus.published
-    ).first()
-    
-    if not post:
-        raise HTTPException(status_code=404, detail="Published post not found")
-    return post
-
-@app.get("/search", response_model=List[schemas.PostResponse])
-def search_posts(q: str, db: Session = Depends(database.get_db)):
-    """Full-text search on title and content of published posts."""
-    results = db.query(models.Post).filter(
-        models.Post.status == schemas.PostStatus.published,
-        (models.Post.title.ilike(f"%{q}%")) | (models.Post.content.ilike(f"%{q}%"))
-    ).all()
-    
-    return results
