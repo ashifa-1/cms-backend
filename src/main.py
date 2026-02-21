@@ -15,7 +15,7 @@ from . import models, schemas, auth, database
 
 app = FastAPI(title="CMS Backend")
 
-# --- DATABASE STARTUP & AUTO-SEEDING (Avoids Manual Setup) ---
+# --- DATABASE STARTUP & AUTO-SEEDING ---
 database.wait_for_db()
 models.Base.metadata.create_all(bind=database.engine)
 
@@ -23,9 +23,7 @@ def auto_seed_data():
     """Satisfies requirement: No manual database seeding steps allowed."""
     db = database.SessionLocal()
     try:
-        # Check if an author already exists to maintain idempotency
         author = db.query(models.User).filter(models.User.email == "admin@example.com").first()
-        
         if not author:
             print("Automated Evaluation: Seeding initial author...", flush=True)
             hashed_pw = auth.get_password_hash("admin123")
@@ -37,13 +35,12 @@ def auto_seed_data():
             )
             db.add(new_user)
             db.commit()
-            print("Seed complete. Credentials: admin@example.com / admin123", flush=True)
+            print("Seed complete: admin@example.com / admin123", flush=True)
     except Exception as e:
         print(f"Auto-seed failed: {e}")
     finally:
         db.close()
 
-# Execute seed on app startup
 auto_seed_data()
 
 # --- REDIS SETUP ---
@@ -67,7 +64,6 @@ def get_current_user(token: str = Depends(api_key_header), db: Session = Depends
         raise HTTPException(status_code=401, detail="Missing Authorization Header")
     
     actual_token = token.replace("Bearer ", "") 
-    
     try:
         payload = jwt.decode(actual_token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
         email: str = payload.get("sub")
@@ -107,16 +103,40 @@ def login(user_credentials: schemas.UserLogin, db: Session = Depends(database.ge
 # --- POST CONTENT ROUTES (Author Only) ---
 
 @app.post("/posts", response_model=schemas.PostResponse)
+def generate_unique_slug(db: Session, title: str, post_id: int = None) -> str:
+    """Generate a URL-friendly, unique slug for the given title.
+    If a slug collision occurs, append a counter until the slug is unique.
+    If `post_id` is provided, ignore the current post when checking collisions.
+    """
+    base = slugify(title)
+    slug = base
+    counter = 1
+    while True:
+        query = db.query(models.Post).filter(models.Post.slug == slug)
+        if post_id:
+            query = query.filter(models.Post.id != post_id)
+        exists = query.first()
+        if not exists:
+            break
+        slug = f"{base}-{counter}"
+        counter += 1
+    return slug
+
+
+@app.post("/posts", response_model=schemas.PostResponse)
 def create_post(post_in: schemas.PostCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
+    # slug uniqueness handled inside helper
+    slug = generate_unique_slug(db, post_in.title)
     new_post = models.Post(
         title=post_in.title,
         content=post_in.content,
-        slug=slugify(post_in.title),
+        slug=slug,
         author_id=current_user.id,
         status=schemas.PostStatus.draft
     )
-    db.add(new_post)
-    db.commit()
+    # transactional write
+    with db.begin():
+        db.add(new_post)
     db.refresh(new_post)
     clear_post_cache()
     return new_post
@@ -137,7 +157,8 @@ def list_published_posts(skip: int = 0, limit: int = 10, db: Session = Depends(d
         models.Post.status == schemas.PostStatus.published
     ).offset(skip).limit(limit).all()
     
-    serializable_data = [json.loads(schemas.PostResponse.from_orm(p).json()) for p in posts]
+    # Fix for Pydantic V2 model validation
+    serializable_data = [json.loads(schemas.PostResponse.model_validate(p).model_dump_json()) for p in posts]
     redis_client.setex(cache_key, CACHE_EXPIRE, json.dumps(serializable_data))
     
     return posts
@@ -158,7 +179,8 @@ def get_published_post(id: int, db: Session = Depends(database.get_db)):
     if not post:
         raise HTTPException(status_code=404, detail="Published post not found")
     
-    serializable_data = json.loads(schemas.PostResponse.from_orm(post).json())
+    # Fix for Pydantic V2 model validation
+    serializable_data = json.loads(schemas.PostResponse.model_validate(post).model_dump_json())
     redis_client.setex(cache_key, CACHE_EXPIRE, json.dumps(serializable_data))
     
     return post
@@ -172,7 +194,7 @@ def search_posts(q: str, db: Session = Depends(database.get_db)):
     return results
 
 # ==========================================
-# END PUBLIC FACING ENDPOINTS
+# AUTHOR CRUD & VERSIONING
 # ==========================================
 
 @app.get("/posts", response_model=List[schemas.PostResponse])
@@ -188,25 +210,29 @@ def get_post(id: int, db: Session = Depends(database.get_db), current_user: mode
 
 @app.put("/posts/{id}", response_model=schemas.PostResponse)
 def update_post(id: int, post_in: schemas.PostCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(get_current_user)):
-    # Transactional Integrity: Fetch, snapshot revision, and update in one session block
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    
-    revision = models.PostRevision(
-        post_id=post.id,
-        title_snapshot=post.title,
-        content_snapshot=post.content,
-        revision_author_id=current_user.id
-    )
-    db.add(revision)
-    
-    post.title = post_in.title
-    post.content = post_in.content
-    post.slug = slugify(post_in.title)
-    post.updated_at = datetime.utcnow()
-    
-    db.commit()
+
+    # transactional update + revision snapshot
+    with db.begin():
+        # snapshot current state
+        revision = models.PostRevision(
+            post_id=post.id,
+            title_snapshot=post.title,
+            content_snapshot=post.content,
+            revision_author_id=current_user.id
+        )
+        db.add(revision)
+
+        # apply changes
+        new_slug = generate_unique_slug(db, post_in.title, post_id=post.id)
+        post.title = post_in.title
+        post.content = post_in.content
+        post.slug = new_slug
+        post.updated_at = datetime.utcnow()
+
+    # commit happens automatically when context exits
     db.refresh(post)
     clear_post_cache(id)
     return post
@@ -227,10 +253,14 @@ def publish_post(id: int, db: Session = Depends(database.get_db), current_user: 
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    
-    post.status = schemas.PostStatus.published
-    post.published_at = datetime.utcnow()
-    db.commit()
+
+    # can only publish drafts or scheduled that are past due
+    if post.status == schemas.PostStatus.published:
+        raise HTTPException(status_code=400, detail="Post is already published")
+
+    with db.begin():
+        post.status = schemas.PostStatus.published
+        post.published_at = datetime.utcnow()
     db.refresh(post)
     clear_post_cache(id)
     return post
@@ -240,10 +270,13 @@ def schedule_post(id: int, sched: schemas.PostSchedule, db: Session = Depends(da
     post = db.query(models.Post).filter(models.Post.id == id, models.Post.author_id == current_user.id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    
-    post.status = schemas.PostStatus.scheduled
-    post.scheduled_for = sched.scheduled_for
-    db.commit()
+
+    if sched.scheduled_for <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="scheduled_for must be in the future")
+
+    with db.begin():
+        post.status = schemas.PostStatus.scheduled
+        post.scheduled_for = sched.scheduled_for
     db.refresh(post)
     clear_post_cache(id)
     return post
@@ -274,14 +307,12 @@ def get_revisions(id: int, db: Session = Depends(database.get_db), current_user:
     response = []
     for r in revisions:
         rev_user = db.query(models.User).filter(models.User.id == r.revision_author_id).first()
-        timestamp = getattr(r, 'revision_timestamp', getattr(r, 'created_at', datetime.utcnow()))
-        
         response.append({
             "revision_id": r.id,
             "post_id": r.post_id,
             "title_snapshot": r.title_snapshot,
             "content_snapshot": r.content_snapshot,
             "revision_author": rev_user.username if rev_user else "System",
-            "revision_timestamp": timestamp
+            "revision_timestamp": r.created_at
         })
     return response

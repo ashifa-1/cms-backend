@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from typing import Optional, List
 from datetime import datetime
 from enum import Enum
@@ -20,8 +20,8 @@ class UserResponse(BaseModel):
     id: int
     username: str
     role: UserRole
-    class Config:
-        from_attributes = True
+    # Modern Pydantic V2 Config
+    model_config = ConfigDict(from_attributes=True)
 
 class TokenResponse(BaseModel):
     token: str
@@ -46,9 +46,8 @@ class PostResponse(PostBase):
     updated_at: Optional[datetime]
     published_at: Optional[datetime]
     scheduled_for: Optional[datetime]
-    class Config:
-        from_attributes = True
-
+    
+    model_config = ConfigDict(from_attributes=True)
 
 class PostRevisionResponse(BaseModel):
     revision_id: int
@@ -58,5 +57,4 @@ class PostRevisionResponse(BaseModel):
     revision_author: str
     revision_timestamp: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

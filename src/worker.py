@@ -6,8 +6,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from . import models, schemas
 
-# Database Configuration
-DATABASE_URL = "postgresql://postgres:postgres@db:5432/cms_db"
+# Database Configuration (can be overridden via env)
+import os
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/cms_db")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -55,8 +56,8 @@ def publish_scheduled_posts():
         db.close()
 
 if __name__ == "__main__":
-    print("Worker started: Monitoring scheduled posts...", flush=True)
+    interval = int(os.getenv("WORKER_INTERVAL_SECONDS", "30"))
+    print(f"Worker started: Monitoring scheduled posts every {interval} seconds...", flush=True)
     while True:
         publish_scheduled_posts()
-        # Check every 30 seconds for due posts
-        time.sleep(30)
+        time.sleep(interval)

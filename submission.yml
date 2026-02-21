@@ -1,0 +1,6 @@
+version: "1.0"
+services:
+  app:
+    build_command: "pip install -r requirements.txt"
+    # This path setup is the most reliable for 'src' structures
+    test_command: "export PYTHONPATH=/app && pytest --maxfail=1 --disable-warnings -q"
